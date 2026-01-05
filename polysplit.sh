@@ -32,14 +32,16 @@ command -v sysctl  >/dev/null || true
 SRC_DIR=""
 OUT_ROOT=""
 CHANNELS_FILE=""
-MODE="new"          # backup|overwrite|new|resume
+MODE="new"          # backup|overwrite|new|resume|final
 YES="0"
 DRYRUN="0"
 PAD_WIDTH="2"
 LAYOUT="flat"       # flat|folders
 WORKERS="0"         # 0 -> auto
 LOGLEVEL="info"     # ffmpeg loglevel
+FFMPEG_THREADS="1" # ffmpeg -threads value (audio work is usually faster with small values when running parallel jobs)
 STITCH="off"        # off|dir|all
+NAME_STYLE="smart"  # default|smart (smart avoids redundant numeric labels)
 
 # ---------- Helpers ----------
 timestamp() { date +%Y%m%d-%H%M%S; }
@@ -65,6 +67,49 @@ sanitize() {
   | tr '[:lower:]' '[:upper:]' \
   | sed -E 's/[[:space:]]+/_/g; s/[^A-Z0-9_+=.-]/_/g; s/_+/_/g; s/^_//; s/_$//'
 }
+
+# Smart label normalization:
+# - If channels.txt line is just the channel number (e.g. "12"), omit it to avoid filenames like _12_12.wav
+# - If NAME_STYLE=default, keep labels exactly as provided (after sanitize)
+normalize_label() {
+  local idx="$1" name="$2" num rest
+  num="$(printf "%0${PAD_WIDTH}d" "${idx}")"
+
+  if [ "${NAME_STYLE}" = "default" ]; then
+    echo "${name}"
+    return
+  fi
+
+  # Empty label -> omit (file will be <prefix>_<NN>.wav)
+  [ -n "${name}" ] || { echo ""; return; }
+
+  # Pure numeric label matching the channel index -> omit
+  if [[ "${name}" =~ ^0*${idx}$ ]] || [ "${name}" = "${num}" ]; then
+    echo ""
+    return
+  fi
+
+  # Labels like CH12 or CH_12 -> omit (prefix already includes NN)
+  if [ "${name}" = "CH${num}" ] || [ "${name}" = "CH_${num}" ]; then
+    echo ""
+    return
+  fi
+
+  # If label starts with the channel index, strip it once (e.g. "12_12" -> "12" -> omitted)
+  if [[ "${name}" =~ ^0*${idx}(_|$) ]]; then
+    rest="${name#${idx}}"
+    rest="${rest#_}"
+    if [ -z "${rest}" ] || [[ "${rest}" =~ ^0*${idx}$ ]] || [ "${rest}" = "${num}" ]; then
+      echo ""
+    else
+      echo "${rest}"
+    fi
+    return
+  fi
+
+  echo "${name}"
+}
+
 
 # Escape a path for FFmpeg concat demuxer: file '...'
 concat_escape() {
@@ -197,19 +242,28 @@ process_one() {
   codec="$(detect_codec "${wav}")"
   fc="$(build_filter_complex "${ch_count}")"
 
-  local args=( -hide_banner -nostdin -loglevel "${LOGLEVEL}" -y -threads 0 -i "${wav}" -filter_complex "${fc}" )
+  local args=( -hide_banner -nostdin -loglevel "${LOGLEVEL}" -y -threads "${FFMPEG_THREADS}" -i "${wav}" -filter_complex "${fc}" )
   local missing=0
 
   i=0
   while [ $i -lt $ch_count ]; do
     num=$(printf "%0${PAD_WIDTH}d" $((i+1)))
     chname="${CHANNEL_NAMES[$i]}"
+    chname="$(normalize_label $((i+1)) "${chname}")"
     lbl=$(printf "ch%02d" "$i")
 
     if [ "${LAYOUT}" = "folders" ]; then
-      outfile="${outdir}/${num}_${chname}_${prefix}.wav"
+      if [ -n "${chname}" ]; then
+        outfile="${outdir}/${num}_${chname}_${prefix}.wav"
+      else
+        outfile="${outdir}/${num}_${prefix}.wav"
+      fi
     else
-      outfile="${outdir}/${prefix}_${num}_${chname}.wav"
+      if [ -n "${chname}" ]; then
+        outfile="${outdir}/${prefix}_${num}_${chname}.wav"
+      else
+        outfile="${outdir}/${prefix}_${num}.wav"
+      fi
     fi
 
     if [ -s "${outfile}" ] && [ "${MODE}" = "resume" ]; then
@@ -308,13 +362,14 @@ process_stitched_session() {
   done < "${segs_tmp}"
   rm -f "${segs_tmp}"
 
-  local args=( -hide_banner -nostdin -loglevel "${LOGLEVEL}" -y -threads 0 -f concat -safe 0 -i "${list_tmp}" -filter_complex "${fc}" )
+  local args=( -hide_banner -nostdin -loglevel "${LOGLEVEL}" -y -threads "${FFMPEG_THREADS}" -f concat -safe 0 -i "${list_tmp}" -filter_complex "${fc}" )
 
   missing=0
   i=0
   while [ $i -lt $ch_count ]; do
     num=$(printf "%0${PAD_WIDTH}d" $((i+1)))
     chname="${CHANNEL_NAMES[$i]}"
+    chname="$(normalize_label $((i+1)) "${chname}")"
     lbl=$(printf "ch%02d" "$i")
 
     # Folders layout: put channel files under a per-session folder, without double nesting.
@@ -325,9 +380,17 @@ process_stitched_session() {
         target_dir="${session_out}/${session_name}"
       fi
       mkout "${target_dir}"
-      outfile="${target_dir}/${num}_${chname}_${session_name}.wav"
+      if [ -n "${chname}" ]; then
+        outfile="${target_dir}/${num}_${chname}_${session_name}.wav"
+      else
+        outfile="${target_dir}/${num}_${session_name}.wav"
+      fi
     else
-      outfile="${session_out}/${session_name}_${num}_${chname}.wav"
+      if [ -n "${chname}" ]; then
+        outfile="${session_out}/${session_name}_${num}_${chname}.wav"
+      else
+        outfile="${session_out}/${session_name}_${num}.wav"
+      fi
     fi
 
     if [ -s "${outfile}" ] && [ "${MODE}" = "resume" ]; then
@@ -406,8 +469,10 @@ while [ $# -gt 0 ]; do
     --layout) LAYOUT="${2-}"; shift 2 ;;
     --mode) MODE="${2-}"; shift 2 ;;
     --stitch) STITCH="${2-}"; shift 2 ;;
+    --name-style) NAME_STYLE="${2-}"; shift 2 ;;
     --workers) WORKERS="${2-}"; shift 2 ;;
     --loglevel) LOGLEVEL="${2-}"; shift 2 ;;
+    --ffmpeg-threads) FFMPEG_THREADS="${2-}"; shift 2 ;;
     --yes) YES="1"; shift ;;
     --dry-run) DRYRUN="1"; shift ;;
     --pad) PAD_WIDTH="${2-}"; shift 2 ;;
@@ -425,7 +490,17 @@ fi
 
 if [ -z "${OUT_ROOT}" ]; then
   SRC_PARENT="$(cd "${SRC_DIR}/.." && pwd)"
-  OUT_ROOT="${SRC_PARENT}/polysplit_out_$(date +%Y-%m-%d)"
+  OUT_ROOT="${SRC_DIR}/PolySplit_Final"
+fi
+
+# Finalize mode: build into a temporary work directory, then replace the final output folder on success.
+FINAL_OUT="${OUT_ROOT}"
+WORK_OUT="${OUT_ROOT}"
+if [ "${MODE}" = "final" ]; then
+  FINAL_OUT="${OUT_ROOT}"
+  WORK_OUT="${OUT_ROOT}__work_$(timestamp)"
+  WORK_OUT="$(unique_dir "${WORK_OUT}")"
+  OUT_ROOT="${WORK_OUT}"
 fi
 
 # Conflict policy for OUT_ROOT (top-level only)
@@ -488,6 +563,7 @@ log "Mode:     ${MODE}"
 log "Stitch:   ${STITCH}"
 log "Workers:  ${WORKERS}"
 log "Loglevel: ${LOGLEVEL}"
+log "FFmpegTh: ${FFMPEG_THREADS}"
 log "Channels: ${#CHANNEL_NAMES[@]}"
 
 # ---------- Parallel worker limiter (Bash 3.2 safe) ----------
@@ -577,6 +653,19 @@ set -e
 
 if [ "${fail}" -ne 0 ]; then
   die "One or more jobs failed. Re-run with --workers 1 and/or --loglevel verbose for easier debugging."
+fi
+
+
+# If final mode, swap work directory into FINAL_OUT now that everything succeeded.
+if [ "${MODE}" = "final" ] && [ "${DRYRUN}" != "1" ]; then
+  if [ -e "${FINAL_OUT}" ]; then
+    # Require confirmation/--yes to replace existing final output
+    confirm_delete "${FINAL_OUT}"
+    safe_rm_rf "${FINAL_OUT}"
+  fi
+  mv "${OUT_ROOT}" "${FINAL_OUT}"
+  OUT_ROOT="${FINAL_OUT}"
+  log "Finalized output: ${FINAL_OUT}"
 fi
 
 log "Done."
