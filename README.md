@@ -1,113 +1,215 @@
-
 # PolySplit
 
-PolySplit splits **polywav** and **AIFF** files into **per‑channel mono WAVs** with clean, sortable names. It reads human‑friendly channel labels from a `channels.txt` file, matches source bit depth automatically, and includes a **safe overwrite flow** with backup/overwrite/new/resume modes. macOS 15.5 compatible.
+PolySplit is a macOS-friendly Bash utility that splits **polywav** (multichannel WAV) and **AIFF** files into **labeled mono WAVs** using FFmpeg.
 
-## Highlights
-- Pan‑based splitting for broad FFmpeg compatibility.
-- Auto‑detects channel count and chooses the best WAV codec to match input (16‑bit, 24‑bit, 32‑bit, float).
-- Channel labels from a simple `channels.txt` (comments supported).
-- **Reliability and safety:** typed confirmation for deletes, `--dry-run` preview, `resume` mode, and a `backup` mode that preserves existing output by renaming it.
-- **Parallel** processing via `--workers N` with sensible defaults from your CPU.
-- Flexible layouts: `flat` (all files in one folder) or `folders` (per‑source subfolder).
-- Clean file names like `01_KICK_SONG1.wav` or `SONG1_01_KICK.wav` depending on the layout.
+It is designed for multitrack recordings from Behringer X32 and M32 systems (including the M32C), including the common case where long recordings are split into multiple 4.31 GB segments because the recorder is writing to a **FAT32** drive.
 
-## Install
-Requires FFmpeg.
+## What it does
+
+- Splits each multichannel file into one WAV per channel
+- Names files using your `channels.txt` labels (comments supported)
+- Optional **stitch mode** that concatenates segmented recordings first (for example `00000001.WAV`, `00000002.WAV`, `00000003.WAV`), then splits the combined stream so you get **one continuous file per channel** for the full set
+
+## Requirements
+
+- macOS
+- Homebrew recommended
+- FFmpeg (includes `ffmpeg` and `ffprobe`)
+
+Install FFmpeg:
 
 ```bash
 brew install ffmpeg
 ```
 
-Download `polysplit.sh` and make it executable:
+## Install
+
+Clone the repo and make the script executable:
 
 ```bash
+git clone https://github.com/derbiter/PolySplit.git
+cd PolySplit
 chmod +x polysplit.sh
 ```
 
-## channels.txt format
-One label per line, optional comments with `#`. Blank lines ignored.
+## Channel labels file (channels.txt)
+
+`channels.txt` must contain **one channel name per line**, in the same order as the recorder’s channel order.
+
+Rules:
+
+- Blank lines are ignored
+- Lines starting with `#` are comments and ignored
+- Labels are sanitized for filenames (uppercased, spaces to `_`, unsafe characters to `_`)
+
+Example:
 
 ```text
-# Example
-Kick
-Snare Top
-Snare Bottom
+KICK
+SNARE TOP
+SNARE BOTTOM
 OH L
 OH R
-Bass DI
-GTR L
-GTR R
-Vox
+# This is a comment
+BASS DI
+BASS MIC
 ```
-The number of non‑comment lines **must** equal the channel count of your polywavs.
 
-## Usage
-Basic:
+PolySplit will stop if the number of non-comment lines does not match the source file’s channel count.
+
+## Basic usage (split each polywav independently)
 
 ```bash
-./polysplit.sh --src "/path/to/source" --out "/path/to/output" --channels "/path/to/channels.txt"
+./polysplit.sh   --src "/path/to/audio"   --out "/path/to/output"   --channels "/path/to/channels.txt"
 ```
 
-Layout:
+This scans `--src` recursively for `.wav`, `.aif`, and `.aiff`, then splits each multichannel file into mono WAVs.
 
-- `--layout flat` (default), file names like `SOURCE_01_KICK.wav`.
-- `--layout folders`, files in `--out/SOURCE/01_KICK_SOURCE.wav`.
+### Output naming (default: flat layout)
 
-Modes:
+Flat layout writes everything directly into `--out`:
 
-- `--mode new` (default), auto‑rename the output root if it already exists.
-- `--mode backup`, rename existing output to `...__backup_YYYYMMDD-HHMMSS` first.
-- `--mode overwrite`, delete existing output after a typed `DELETE` confirmation (or `--yes` for non‑interactive).
-- `--mode resume`, keep what is already exported and only write missing files.
+- `<stem>_<NN>_<CHANNEL>.wav`
+
+Example:
+
+- `5C22B94E_01_KICK.wav`
+- `5C22B94E_02_SNARE_TOP.wav`
+
+## Stitch mode (recommended for X32/M32 FAT32 segments)
+
+When recording to FAT32, long takes are often split into multiple segment files (commonly 8-digit names):
+
+- `00000001.WAV`
+- `00000002.WAV`
+- `00000003.WAV`
+- `00000004.WAV`
+
+Stitch mode concatenates the segments in filename order and then splits into mono WAVs, producing one continuous per-channel file for the full recording.
+
+### Stitch a single session folder
+
+This is the most common workflow: point `--src` at the session folder containing the segments and set `--stitch dir`.
+
+```bash
+./polysplit.sh   --src "/Volumes/Q4 2025/KBC 2025/AUDIO/5C22B94E"   --out "/Volumes/Q4 2025/KBC 2025/AUDIO/5C22B94E/EXPORTS"   --channels "/Volumes/Q4 2025/KBC 2025/AUDIO/5C22B94E/channels.txt"   --stitch dir
+```
+
+Output (flat layout default):
+
+- `5C22B94E_01_KICK.wav`
+- `5C22B94E_02_SNARE_TOP.wav`
+- ...
+
+### How stitch discovery works
+
+`--stitch dir`:
+
+- If `--src` itself contains segment files named like `00000001.WAV`, it treats `--src` as one session.
+- Otherwise, it searches under `--src` and treats each directory containing segment files as a separate session.
+
+`--stitch all`:
+
+- Treats `--src` as one session and attempts to stitch segment files directly under `--src`.
+- Use with care. `dir` is usually safer for real show folders.
+
+### Stitch validations
+
+Before stitching, PolySplit validates that all segments in the session have:
+
+- The same channel count
+- The same sample rate
+
+If anything mismatches, it stops with a clear error.
+
+## Layouts
+
+### Flat (default)
+
+All output files go into `--out`.
+
+```bash
+--layout flat
+```
+
+### Folders
+
+Creates a subfolder per source file or per stitched session.
+
+```bash
+--layout folders
+```
+
+Naming in folders layout:
+
+- `<out>/<session>/<NN>_<CHANNEL>_<session>.wav`
+
+Example:
+
+- `EXPORTS/5C22B94E/01_KICK_5C22B94E.wav`
+
+## Output safety modes
+
+`--mode` controls what happens when the output folder already exists.
+
+- `new` (default): automatically writes to a new folder by appending `_2`, `_3`, etc
+- `backup`: renames the existing output folder to `__backup_<timestamp>` and then writes fresh output
+- `overwrite`: deletes the output folder first (requires confirmation)
+- `resume`: keeps the output folder and skips files that already exist (useful for reruns)
 
 Examples:
 
 ```bash
-# Dry‑run preview
-./polysplit.sh --src "/in" --out "/out" --channels "/in/channels.txt" --dry-run
-
-# Overwrite with typed confirmation (interactive)
-./polysplit.sh --src "/in" --out "/out" --channels "/in/channels.txt" --mode overwrite
-
-# Overwrite non‑interactively (e.g., CI)
-./polysplit.sh --src "/in" --out "/out" --channels "/in/channels.txt" --mode overwrite --yes
-
-# Backup then run 4 files in parallel using per‑file folders
-./polysplit.sh --src "/in" --out "/out" --channels "./channels.txt" --mode backup --layout folders --workers 4
-
-# Resume and skip files that already exist
+# Resume (skip already-exported files)
 ./polysplit.sh --src "/in" --out "/out" --channels "./channels.txt" --mode resume
+
+# Overwrite non-interactively (use carefully)
+./polysplit.sh --src "/in" --out "/out" --channels "./channels.txt" --mode overwrite --yes
 ```
 
-## Output layout
-For each source file, PolySplit writes mono WAVs named based on your chosen layout:
+## Dry run
 
-```
-# --layout folders
-OUT/SOURCE/01_KICK_SOURCE.wav
-OUT/SOURCE/02_SNARE_TOP_SOURCE.wav
+Use `--dry-run` to preview actions without writing anything:
 
-# --layout flat
-OUT/SOURCE_01_KICK.wav
-OUT/SOURCE_02_SNARE_TOP.wav
+```bash
+./polysplit.sh   --src "/in"   --out "/out"   --channels "./channels.txt"   --stitch dir   --dry-run
 ```
 
-Bit depth and format are auto‑matched to the source. BWF/iXML metadata is preserved when your ffmpeg build supports it.
+## Performance tuning (Apple Silicon friendly)
 
-## Safeties
-- **Destructive operations require confirmation.** `overwrite` deletes only after you type `DELETE` or pass `--yes`.
-- **Backup mode.** `backup` preserves your previous results by renaming the existing output directory before writing.
-- **DRY RUN.** `--dry-run` shows every directory create and every file that would be written.
-- **Strict channel count check.** If `channels.txt` does not match the source channel count, PolySplit stops and tells you what to fix.
-- **Non‑empty path guard.** Refuses to delete `/` or `.` and requires a non‑empty target path.
+PolySplit can run multiple FFmpeg jobs in parallel.
 
-## Performance
-- Use `--workers N` to process multiple files in parallel. On Apple silicon, `--workers 4` or `--workers 8` is a good starting point.
-- Fast SSD output makes a big difference for large sessions.
+- `--workers N` sets the number of parallel jobs.
+- Default is automatic (CPU/2), capped at 12.
 
-## Why the rename?
-This project was previously called **polywav‑split‑macos**. The new name, **PolySplit**, pairs with **TapeShift** stylistically.
+On an Apple M4 Pro, good starting points:
+
+- `--workers 6` to `8` if you are writing to a slower external drive
+- `--workers 10` to `12` if you are writing to a fast SSD and you are not IO-bound
+
+Example:
+
+```bash
+./polysplit.sh --src "/in" --out "/out" --channels "./channels.txt" --workers 8
+```
+
+## Logging and debugging
+
+- `--loglevel` controls FFmpeg verbosity: `quiet`, `error`, `warning`, `info`, `verbose`
+- If something fails, rerun with fewer workers and more verbosity:
+
+```bash
+./polysplit.sh --src "/in" --out "/out" --channels "./channels.txt" --workers 1 --loglevel verbose
+```
+
+## Tips for zsh users
+
+Always quote paths. This avoids glob expansion problems in zsh when arguments contain special characters:
+
+```bash
+./polysplit.sh --src "/Volumes/SHOW/AUDIO/5C22B94E" --out "/Volumes/SHOW/AUDIO/EXPORTS" --channels "/Volumes/SHOW/AUDIO/channels.txt"
+```
 
 ## License
-MIT, see `LICENSE`.
+
+MIT. See `LICENSE`.
